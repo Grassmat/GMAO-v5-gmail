@@ -1,0 +1,43 @@
+import fs from 'node:fs';
+import ts from 'typescript';
+import assert from 'node:assert/strict';
+import {DatabaseSync} from 'node:sqlite';
+const sql=new DatabaseSync(':memory:');
+sql.exec('CREATE TABLE records(id TEXT PRIMARY KEY,kind TEXT,site TEXT,data TEXT NOT NULL)');
+let race=null;
+const db={prepare(query){return {bind(...values){return {async run(){if(race){race();race=null;}const result=sql.prepare(query).run(...values);return {meta:{changes:Number(result.changes)}};}}}}}};
+function module(file,deps,names){const source=fs.readFileSync(file,'utf8').replace(/^import .*;$/gm,'').replace(/\bexport /g,'');return new Function(...Object.keys(deps),ts.transpile(source,{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.CommonJS})+';return {'+names.join(',')+'}')(...Object.values(deps));}
+class AppError extends Error {constructor(message,status=400){super(message);this.status=status;}}
+const allowSite=(u,site)=>{if(!['admin','director'].includes(u.role)&&u.site!==site)throw new AppError('Forbidden',403);};
+const {saveMachineOrder}=module('lib/maintenance/machine-order.ts',{database:()=>db,allowSite,AppError,validSite:async site=>{assert(['a','b'].includes(site));}},['saveMachineOrder']);
+const {orderedMachines,movedMachines}=module('lib/maintenance/machine-ordering.ts',{},['orderedMachines','movedMachines']);
+const insert=sql.prepare('INSERT INTO records VALUES(?,?,?,?)');
+for(const [id,site] of [['one','a'],['two','a'],['three','a'],['elsewhere','b']])insert.run(id,'machine',site,JSON.stringify({name:id,manualServiceState:'stopped',archived:id==='three'}));
+const rows=()=>sql.prepare("SELECT rowid AS creationOrder,* FROM records WHERE kind='machine' AND site='a'").all().map(r=>({...r,...JSON.parse(r.data)}));
+const input=ids=>({site:'a',ids,expected:rows().map(r=>({id:r.id,order:r.displayOrder??null}))});
+const manager={role:'manager',site:'a'};
+const first=input(['two','three','one']);
+await saveMachineOrder(manager,first);
+assert.deepEqual(orderedMachines(rows()).map(r=>r.id),first.ids);
+assert(rows().every(r=>r.manualServiceState==='stopped'));
+assert.equal(rows().find(r=>r.id==='three').archived,true);
+assert.equal(JSON.parse(sql.prepare("SELECT data FROM records WHERE id='elsewhere'").get().data).displayOrder,undefined);
+await assert.rejects(()=>saveMachineOrder(manager,first),e=>e.status===409);
+for(const ids of [['one','one','two'],['one','two','elsewhere'],['one','two']])await assert.rejects(()=>saveMachineOrder(manager,input(ids)),e=>[400,409].includes(e.status));
+await assert.rejects(()=>saveMachineOrder({role:'manager',site:'b'},input(['one','two','three'])),e=>e.status===403);
+await assert.rejects(()=>saveMachineOrder({role:'technician',site:'b'},input(['one','two','three'])),e=>e.status===403);
+const concurrent=input(['one','two','three']);
+race=()=>sql.prepare("UPDATE records SET data=json_set(data,'$.displayOrder',9) WHERE id='two'").run();
+await assert.rejects(()=>saveMachineOrder(manager,concurrent),e=>e.status===409);
+assert.equal(rows().find(r=>r.id==='one').displayOrder,2); // no partial update
+const added=input(['one','two','three']);
+race=()=>insert.run('new','machine','a','{"name":"New"}');
+await assert.rejects(()=>saveMachineOrder(manager,added),e=>e.status===409);
+assert.equal(orderedMachines(rows()).at(-1).id,'new');
+const stateChange=input(['new','three','two','one']);
+race=()=>sql.prepare("UPDATE records SET data=json_set(data,'$.manualServiceState','running') WHERE id='one'").run();
+await saveMachineOrder({role:'director',site:null},stateChange);
+assert.equal(rows().find(r=>r.id==='one').manualServiceState,'running');
+await saveMachineOrder({role:'technician',site:'a'},input(['one','two','three','new']));
+assert.deepEqual(movedMachines(rows(),'one','three'),['two','three','one','new']);
+console.log('PASS: shared persisted ordering, permissions, invalid IDs, archived machines, appended machines, atomic race rejection and preservation of machine state.');
